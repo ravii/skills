@@ -815,9 +815,46 @@ def admonitions(body):
     return re.sub(r'<blockquote>(.*?)</blockquote>', panel, body, flags=re.S)
 
 
+def revise_macro(macro_xml, source):
+    """Create an app-style revision while preserving the macro ids and name."""
+    data = plantuml_encode(source)
+    now = (datetime.datetime.now(datetime.timezone.utc)
+           .strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z')
+    current = re.search(
+        r'key="name">[^<]*</ac:adf-parameter><ac:adf-parameter key="data">[^<]*'
+        r'</ac:adf-parameter><ac:adf-parameter key="revision" type="integer">(\d+)<',
+        macro_xml,
+    )
+    if not current:
+        return None
+    revision = int(current.group(1)) + 1
+    revised = re.sub(
+        r'(key="name">[^<]*</ac:adf-parameter><ac:adf-parameter key="data">)[^<]*'
+        r'(</ac:adf-parameter><ac:adf-parameter key="revision" type="integer">)\d+<',
+        lambda m: f'{m.group(1)}{data}{m.group(2)}{revision}<',
+        macro_xml,
+    )
+    entry = ('<ac:adf-parameter-value>' + adf_param('data', data) +
+             adf_param('revision', revision, 'integer') + adf_param('created-at', now) +
+             '</ac:adf-parameter-value>')
+    revised = re.sub(
+        r'(<ac:adf-parameter key="history">.*?)'
+        r'(</ac:adf-parameter><ac:adf-parameter key="draft")',
+        lambda m: m.group(1) + entry + m.group(2),
+        revised,
+        flags=re.S,
+    )
+    try:
+        if extension_source(parse_storage(revised)[0]) != source:
+            return None
+    except ET.ParseError:
+        return None
+    return revised
+
+
 def diagram_builder(api, page, next_version):
-    """Keeps an unchanged diagram's macro as it is (ids, app history); makes new ones."""
-    existing = {}
+    """Keep unchanged diagrams and revise changed diagrams at their original positions."""
+    existing, in_order = {}, []
     for match in ADF_EXTENSION_RE.finditer(page_storage(page) if page else ''):
         try:
             source = extension_source(parse_storage(match.group(0))[0])
@@ -825,15 +862,23 @@ def diagram_builder(api, page, next_version):
             continue
         if source is not None:
             existing.setdefault(source, match.group(0))
+            in_order.append((source, match.group(0)))
     state = {}
 
     def build(sources, names):
-        check_plantuml(s for s in sources if s not in existing)  # unchanged ones are on the page already
+        # Unchanged diagrams are already on the page and need no local syntax check.
+        check_plantuml(s for s in sources if s not in existing)
+        kept = set(sources)
         out = []
         for index, (source, name) in enumerate(zip(sources, names)):
             if source in existing:
                 out.append(existing[source])
                 continue
+            if index < len(in_order) and in_order[index][0] not in kept:  # edited in place
+                revised = revise_macro(in_order[index][1], source)
+                if revised:
+                    out.append(revised)
+                    continue
             if 'ctx' not in state:
                 state['ctx'] = find_diagram_context(api, page, next_version)
             out.append(plantuml_macro(source, name or f'diagram {index + 1}', state['ctx'], index))
